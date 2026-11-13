@@ -58,3 +58,7 @@
 
 CREATE TABLE IF NOT EXISTS collection_entries(id TEXT PRIMARY KEY REFERENCES share_submissions(id) ON DELETE CASCADE,share_id TEXT NOT NULL,browser_hash TEXT NOT NULL,payload TEXT NOT NULL,updated_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS ix_collection_entries ON collection_entries(share_id,browser_hash);
+
+CREATE TABLE IF NOT EXISTS digests(id TEXT PRIMARY KEY, user_id TEXT, source TEXT, account_id TEXT, conversation_id TEXT, payload TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS ix_digests_owner ON digests(user_id,created_at);
+CREATE INDEX IF NOT EXISTS ix_digests_chat ON digests(user_id,source,account_id,conversation_id,created_at);

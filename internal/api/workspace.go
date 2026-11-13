@@ -252,16 +252,40 @@ func (s *Server) messages(ctx context.Context, db store.SQL, rows []Object) []Ob
 	}
 	return out
 }
+func (s *Server) allTasks(ctx context.Context, db store.SQL, user string) []Object {
+	// 一次查出全部任务与附件后在内存里分组，避免每个任务 2~3 条 SQL 的 N+1。
+	rows := query(ctx, db, "SELECT payload FROM tasks WHERE user_id=? ORDER BY rowid DESC", user)
+	tasks := make([]Object, 0, len(rows))
+	index := make(map[string]Object, len(rows))
+	for _, row := range rows {
+		payload := store.Payload(row)
+		payload["attachments"] = []any{}
+		tasks = append(tasks, payload)
+		if id := str(payload, "id"); id != "" {
+			index[id] = payload
+		}
+	}
+	if len(tasks) == 0 {
+		return tasks
+	}
+	for _, file := range query(ctx, db, "SELECT id,name,size,sha256,kind,task_id FROM attachments WHERE user_id=? ORDER BY rowid", user) {
+		if task := index[str(file, "task_id")]; task != nil {
+			task["attachments"] = append(list(task, "attachments"), file)
+		}
+	}
+	return tasks
+}
 func (s *Server) snapshot(ctx context.Context, user string) any {
 	return s.transaction(ctx, func(db store.SQL) any {
 		cursor := one(ctx, db, "SELECT COALESCE(MAX(seq),0) AS cursor FROM events WHERE user_id=?", user)
-		tasks := []Object{}
-		for _, t := range query(ctx, db, "SELECT id FROM tasks WHERE user_id=? ORDER BY rowid DESC", user) {
-			tasks = append(tasks, s.task(ctx, db, user, str(t, "id")))
-		}
+		tasks := s.allTasks(ctx, db, user)
 		messages := s.messages(ctx, db, query(ctx, db, "SELECT payload FROM messages WHERE user_id=? ORDER BY rowid DESC LIMIT 200", user))
+		digests := []Object{}
+		for _, row := range query(ctx, db, "SELECT payload FROM digests WHERE user_id=? ORDER BY rowid DESC LIMIT 40", user) {
+			digests = append(digests, store.Payload(row))
+		}
 		shelf := s.shelfItems(ctx, db, user)
-		return Object{"cursor": cursor["cursor"], "tasks": tasks, "messages": messages, "shelf": shelf}
+		return Object{"cursor": cursor["cursor"], "tasks": tasks, "messages": messages, "digests": digests, "shelf": shelf}
 	})
 }
 func (s *Server) messageRoutes() {

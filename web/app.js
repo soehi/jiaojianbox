@@ -29,7 +29,7 @@ const EMOJI={'微笑':'🙂','撇嘴':'😕','色':'😍','发呆':'😮','得�
 const EMOJI_RE=new RegExp('\\[(' + Object.keys(EMOJI).sort((a,b)=>b.length-a.length).map(k=>k.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')).join('|') + ')\\]','g');
 const pretty = text => String(text ?? '').replace(/[\x00-\x08\x0b-\x1f]/g,'').replace(EMOJI_RE,(m,name)=>EMOJI[name]);
 const classifications = { actionable: ['待办通知', 'green'], chatting: ['普通聊天', ''], irrelevant: ['其他信息', ''], unprocessed: ['待分析', 'orange'] };
-const state = { session: null, profile: '', page: 'inbox', snapshot: { tasks: [], messages: [], cursor: 0 }, pending: [], selected: null, taskId: null, contexts: new Set(), search: '', source: 'all', category: 'all', taskFilter: 'active', online: false, socket: null, sources: {}, busyAnalysis: new Set(), isRegister: false, generation: 0, firstRenderDone: false, cmdkIndex: 0 };
+const state = { session: null, profile: '', page: 'inbox', snapshot: { tasks: [], messages: [], digests: [], cursor: 0 }, pending: [], selected: null, selectedDigest: null, digestMessages: [], digestBusy: '', taskId: null, contexts: new Set(), search: '', source: 'all', category: 'all', taskFilter: 'active', online: false, socket: null, sources: {}, busyAnalysis: new Set(), isRegister: false, generation: 0, firstRenderDone: false, cmdkIndex: 0 };
 let editingUrgency = null, editingReminders = null;
 let flushRunning = false, refreshRunning = false, cacheTimer, reconnectTimer, llmSettings = null, llmCredit = null, editingVersion = 0, uploading = false, lastSeenMessageId = null, pendingUndoId = null;
 
@@ -162,6 +162,24 @@ function cacheSoon() {
     if (profile === state.profile) storeSet('cache-' + profile, { snapshot: state.snapshot, pending: state.pending }).catch(() => toast('本机缓存保存失败，请检查存储空间'));
   }, 250);
 }
+function conversationsNeedingDigest() {
+  const seen = new Map();
+  for (const message of state.snapshot.messages) {
+    if (message.triage === 'ignored' || message.digest_id) continue;
+    const classification = message.analysis?.classification;
+    if (classification === 'actionable') continue;
+    const key = `${message.source}|${message.account_id}|${message.conversation_id}`;
+    if (!seen.has(key)) seen.set(key, { source: message.source, account_id: message.account_id, conversation_id: message.conversation_id, name: message.conversation_name, newest: 0 });
+    const item = seen.get(key);
+    item.newest = Math.max(item.newest, new Date(message.sent_at).getTime() || 0);
+    if (message.conversation_name) item.name = message.conversation_name;
+  }
+  return { conversations: [...seen.values()], digests: state.snapshot.digests || [] };
+}
+function digestableMessages() {
+  const { conversations } = conversationsNeedingDigest();
+  return conversations.sort((a, b) => b.newest - a.newest);
+}
 function applyPending(snapshot) {
   const tasks = [...snapshot.tasks];
   for (const item of state.pending) {
@@ -179,7 +197,7 @@ async function refresh({ renderPage = true } = {}) {
   try {
     const snapshot = await api('/api/snapshot');
     if (generation !== state.generation) return;
-    const contentChanged = JSON.stringify(state.snapshot.tasks) !== JSON.stringify(applyPending(snapshot).tasks) || JSON.stringify(state.snapshot.messages.slice(0, 200)) !== JSON.stringify(snapshot.messages) || JSON.stringify(state.snapshot.shelf) !== JSON.stringify(snapshot.shelf);
+    const contentChanged = JSON.stringify(state.snapshot.tasks) !== JSON.stringify(applyPending(snapshot).tasks) || JSON.stringify(state.snapshot.messages.slice(0, 200)) !== JSON.stringify(snapshot.messages) || JSON.stringify(state.snapshot.digests) !== JSON.stringify(snapshot.digests) || JSON.stringify(state.snapshot.shelf) !== JSON.stringify(snapshot.shelf);
     const previousMessages = state.snapshot.messages;
     // 分享列表由 /api/shares 维护，快照刷新必须保留它，否则每次轮询都会清空分享页。
     const previousShares = state.snapshot.shares;
@@ -223,6 +241,50 @@ function syncSocket() {
     if (event.code === 4401) return toast('登录已过期，请重新登录');
     reconnectTimer = setTimeout(syncSocket, 2500);
   };
+}
+let digestRunning = false;
+async function digestOne(target, force = false) {
+  if (digestRunning) { toast('正在汇总，请稍候'); return; }
+  digestRunning = true;
+  state.digestBusy = target.conversation_id;
+  if (state.page === 'inbox') render();
+  try {
+    const body = {
+      source: target.source,
+      account_id: target.account_id || '',
+      conversation_id: target.conversation_id,
+      min_age_seconds: force ? 0 : 300,
+      limit: 60,
+      force: !!force,
+    };
+    const result = await api('/api/digests', 'POST', body);
+    if (result && result.id) {
+      state.snapshot.digests = [result, ...(state.snapshot.digests || []).filter(d => d.id !== result.id)].slice(0, 40);
+      state.selectedDigest = result.id; state.selected = null; state.digestMessages = [];
+      for (const message of state.snapshot.messages) if ((result.message_ids || []).includes(message.id)) message.digest_id = result.id;
+      toast(`已汇总 ${result.conversation_name || '群聊'}：${result.headline || ''}`);
+    }
+  } catch (error) {
+    toast(error.message || '群聊汇总失败');
+  } finally {
+    digestRunning = false; state.digestBusy = '';
+    cacheSoon();
+    if (state.page === 'inbox') render();
+  }
+}
+async function digestAll(button) {
+  const targets = digestableMessages();
+  if (!targets.length) return toast('暂无可汇总的群聊');
+  if (button) button.disabled = true;
+  try {
+    for (const target of targets.slice(0, 6)) {
+      if (digestRunning) await new Promise(resolve => setTimeout(resolve, 400));
+      await digestOne(target);
+    }
+    if (targets.length > 6) toast(`本轮汇总了 6 个群聊，其余会在下次继续`);
+  } finally {
+    if (button?.isConnected) button.disabled = false;
+  }
 }
 async function flushOutbox() {
   if (flushRunning || !state.session) return;
@@ -324,20 +386,88 @@ function messageClass(message) {
   if (!message.analysis && message.analysis_error) return ['分析失败', 'red'];
   return classifications[message.analysis?.classification || 'unprocessed'];
 }
+function inboxMode() { return state.inboxMode || 'digest'; }
+function isActionable(message) { return message.analysis?.classification === 'actionable'; }
+function needsAttention(message) { return !message.analysis && message.triage !== 'ignored'; }
 function filteredMessages() {
+  const mode = inboxMode();
   return state.snapshot.messages.filter(m => {
     const classification = m.analysis?.classification || 'unprocessed';
-    return (state.source === 'all' || m.source === state.source) &&
-      (state.category === 'ignored' ? m.triage === 'ignored' : m.triage !== 'ignored' && (state.category === 'all' || classification === state.category)) &&
-      (!state.search || `${m.text} ${m.conversation_name} ${m.sender_name}`.toLowerCase().includes(state.search.toLowerCase()));
+    if (state.source !== 'all' && m.source !== state.source) return false;
+    if (state.category === 'ignored') return m.triage === 'ignored';
+    if (m.triage === 'ignored') return false;
+    // 摘要视图只保留需要行动或尚未分析的消息；其余交给群聊摘要。
+    if (mode === 'digest' && state.category === 'all' && !isActionable(m) && !needsAttention(m)) return false;
+    if (state.category !== 'all' && classification !== state.category) return false;
+    return !state.search || `${m.text} ${m.conversation_name} ${m.sender_name}`.toLowerCase().includes(state.search.toLowerCase());
   });
+}
+function filteredDigests() {
+  if (inboxMode() !== 'digest' || state.category === 'ignored') return [];
+  const query = state.search.toLowerCase();
+  return (state.snapshot.digests || []).filter(d =>
+    (state.source === 'all' || d.source === state.source) &&
+    (!query || `${d.headline} ${d.conversation_name} ${(d.topics || []).map(t => t.title + ' ' + t.summary).join(' ')}`.toLowerCase().includes(query)));
+}
+function digestRow(digest) {
+  const topics = digest.topics || [];
+  const active = state.selectedDigest === digest.id;
+  const preview = topics.slice(0, 2).map(t => t.title).filter(Boolean).join(' · ') || digest.headline || '群聊摘要';
+  return `<article class="digest-row ${active ? 'selected' : ''}" data-digest="${esc(digest.id)}" tabindex="0" role="button" aria-label="查看 ${esc(digest.conversation_name || '群聊')} 的摘要">
+    <div class="message-body">
+      <div class="message-meta">${sourceTag(digest.source)}<strong>${esc(digest.conversation_name || '群聊')}</strong><time>${formatDate(digest.to)}</time></div>
+      <div class="message-excerpt"><span class="digest-badge">摘要</span>${esc(digest.headline || preview)}</div>
+      <div class="message-bottom"><span class="helper">${topics.length} 个话题 · ${digest.message_count || 0} 条原始消息</span></div>
+    </div>
+    <div class="row-actions"><button data-row-action="digest-open" data-id="${esc(digest.id)}">查看原文</button><button data-row-action="digest-delete" data-id="${esc(digest.id)}" class="danger-hover">取消汇总</button></div>
+  </article>`;
 }
 function inboxView() {
   const messages = filteredMessages();
-  const selected = state.snapshot.messages.find(m => m.id === state.selected);
-  return heading('通知', '从聊天中找到重要通知，自动分析并提取待办。', `<button class="secondary" data-action="paste">粘贴通知</button><button class="primary" data-action="new-task">${icon('plus')}新建待办</button>`) +
-    `<div class="toolbar"><div class="search"><span>${icon('search')}</span><input id="inbox-search" placeholder="搜索通知、群聊或联系人" value="${esc(state.search)}" aria-label="搜索消息"></div><select id="source-filter" aria-label="来源"><option value="all">全部来源</option><option value="qq">QQ</option><option value="wechat">微信</option><option value="manual">手动添加</option></select><select id="category-filter" aria-label="分类"><option value="all">全部分类</option><option value="actionable">待办通知</option><option value="unprocessed">待分析</option><option value="chatting">普通聊天</option><option value="irrelevant">其他信息</option><option value="ignored">已忽略</option></select><span class="result-count">${messages.length} 条消息</span></div>` +
-    `<div class="inbox-grid ${selected ? 'has-selection' : ''}"><section class="panel messages-panel"><div class="panel-head"><h3>最近通知</h3><small>${state.contexts.size ? '已选 ' + state.contexts.size + ' 条上下文' : '勾选消息可作为上下文'}</small></div><div class="message-list ${state.firstRenderDone ? '' : 'stagger'}">${messages.length ? messages.map(m => `<article class="message-row ${state.firstRenderDone ? '' : 'stagger-item'} ${state.selected === m.id ? 'selected' : ''} ${m.isNew ? 'flash' : ''}" data-message="${esc(m.id)}" tabindex="0" role="button" aria-label="查看 ${esc(m.conversation_name)} 的消息"><input class="select-context" type="checkbox" data-context="${esc(m.id)}" ${state.contexts.has(m.id) ? 'checked' : ''} aria-label="选择为上下文"><div class="message-body"><div class="message-meta">${sourceTag(m.source)}<strong>${esc(m.conversation_name || '手动通知')}</strong><time>${formatDate(m.sent_at)}</time></div><div class="message-excerpt">${esc(pretty(m.text))}</div><div class="message-bottom">${tag(...messageClass(m))}${m.analysis ? confidenceChip(m.analysis.confidence) : ''}<span class="sender">${esc(m.sender_name || '我')}</span></div></div><div class="row-actions"><button data-row-action="message-task" data-id="${esc(m.id)}">建待办</button><button data-row-action="ignore-message" data-id="${esc(m.id)}" class="danger-hover">忽略</button></div></article>`).join('') : empty('暂无通知', state.search ? '换个关键词或筛选条件试试。' : '连接 QQ / 微信，或先粘贴一条通知。', '<button class="primary" data-action="paste">添加第一条通知</button>')}</div><div class="load-more"><button class="plain-button" data-action="more-messages">加载更早的消息</button></div></section><section class="panel detail">${selected ? messageDetail(selected) : empty('先选一条消息', '通知原文、上下文和分析结果会显示在这里。')}</section></div>`;
+  const digests = filteredDigests();
+  const mode = inboxMode();
+  const selectedMessage = state.snapshot.messages.find(m => m.id === state.selected);
+  const selectedDigest = (state.snapshot.digests || []).find(d => d.id === state.selectedDigest);
+  const detail = selectedDigest ? digestDetail(selectedDigest) : selectedMessage ? messageDetail(selectedMessage) : empty('先选一条消息', '通知原文、上下文和分析结果会显示在这里。');
+  const pendingDigest = digestableMessages().length;
+  const toggle = `<div class="chart-mode" role="tablist" aria-label="通知视图">
+    <button type="button" role="tab" data-inbox-mode="digest" class="${mode === 'digest' ? 'on' : ''}" aria-selected="${mode === 'digest'}">摘要</button>
+    <button type="button" role="tab" data-inbox-mode="all" class="${mode === 'all' ? 'on' : ''}" aria-selected="${mode === 'all'}">全部消息</button></div>`;
+  const digestSection = digests.length ? `<div class="digest-list ${state.firstRenderDone ? '' : 'stagger'}">${digests.map(d => `<div class="${state.firstRenderDone ? '' : 'stagger-item'}">${digestRow(d)}</div>`).join('')}</div>` : '';
+  const messageSection = messages.length ? messages.map(m => `<article class="message-row ${state.firstRenderDone ? '' : 'stagger-item'} ${state.selected === m.id && !state.selectedDigest ? 'selected' : ''} ${m.isNew ? 'flash' : ''}" data-message="${esc(m.id)}" tabindex="0" role="button" aria-label="查看 ${esc(m.conversation_name)} 的消息"><input class="select-context" type="checkbox" data-context="${esc(m.id)}" ${state.contexts.has(m.id) ? 'checked' : ''} aria-label="选择为上下文"><div class="message-body"><div class="message-meta">${sourceTag(m.source)}<strong>${esc(m.conversation_name || '手动通知')}</strong><time>${formatDate(m.sent_at)}</time></div><div class="message-excerpt">${esc(pretty(m.text))}</div><div class="message-bottom">${tag(...messageClass(m))}${m.analysis ? confidenceChip(m.analysis.confidence) : ''}<span class="sender">${esc(m.sender_name || '我')}</span></div></div><div class="row-actions"><button data-row-action="message-task" data-id="${esc(m.id)}">建待办</button><button data-row-action="ignore-message" data-id="${esc(m.id)}" class="danger-hover">忽略</button></div></article>`).join('') : '';
+  const summaryHint = mode === 'digest' && !digests.length && !messages.length
+    ? empty('暂无需要关注的通知', '群聊内容会自动汇总成摘要，只有真正的待办会单独出现。', '<button class="primary" data-action="digest-all">立即汇总群聊</button>')
+    : '';
+  const digestButton = mode === 'digest' ? `<button class="plain-button" data-action="digest-all" ${pendingDigest ? '' : 'disabled'}>${pendingDigest ? `汇总 ${pendingDigest} 个群聊` : '暂无可汇总的群聊'}</button>` : '';
+  return heading('通知', '重要通知单独列出，其余群聊内容自动汇总。', `<button class="secondary" data-action="paste">粘贴通知</button><button class="primary" data-action="new-task">${icon('plus')}新建待办</button>`) +
+    `<div class="toolbar">${toggle}<div class="search"><span>${icon('search')}</span><input id="inbox-search" placeholder="搜索通知、群聊或联系人" value="${esc(state.search)}" aria-label="搜索消息"></div><select id="source-filter" aria-label="来源"><option value="all">全部来源</option><option value="qq">QQ</option><option value="wechat">微信</option><option value="manual">手动添加</option></select><select id="category-filter" aria-label="分类"><option value="all">全部</option><option value="actionable">待办通知</option><option value="unprocessed">待分析</option><option value="chatting">普通聊天</option><option value="irrelevant">其他信息</option><option value="ignored">已忽略</option></select><span class="result-count">${mode === 'digest' ? `${digests.length} 条摘要 · ${messages.length} 条通知` : `${messages.length} 条消息`}</span>${digestButton}</div>` +
+    `<div class="inbox-grid ${(selectedMessage && !selectedDigest) || selectedDigest ? 'has-selection' : ''}"><section class="panel messages-panel"><div class="panel-head"><h3>${mode === 'digest' ? '最近摘要' : '最近通知'}</h3><small>${state.contexts.size ? '已选 ' + state.contexts.size + ' 条上下文' : '勾选消息可作为上下文'}</small></div>${summaryHint}${digestSection}${messageSection ? `<div class="message-list ${state.firstRenderDone ? '' : 'stagger'}">${messageSection}</div>` : ''}${!summaryHint && !digests.length && !messages.length ? empty('暂无通知', state.search ? '换个关键词或筛选条件试试。' : '连接 QQ / 微信，或先粘贴一条通知。', '<button class="primary" data-action="paste">添加第一条通知</button>') : ''}<div class="load-more"><button class="plain-button" data-action="more-messages">加载更早的消息</button></div></section><section class="panel detail">${detail}</section></div>`;
+}
+function digestDetail(digest) {
+  const topics = digest.topics || [];
+  const ids = new Set(digest.message_ids || []);
+  const messages = state.digestMessages.length ? state.digestMessages : state.snapshot.messages.filter(m => ids.has(m.id));
+  const byId = new Map(messages.map(m => [m.id, m]));
+  const topicHtml = topics.map((topic, index) => {
+    const refs = (topic.messages || []).map(id => byId.get(id)).filter(Boolean);
+    return `<details class="digest-topic" ${index === 0 ? 'open' : ''}>
+      <summary><strong>${esc(topic.title)}</strong><span class="helper">${(topic.messages || []).length} 条</span></summary>
+      <p>${esc(topic.summary || '')}</p>
+      ${refs.length ? `<div class="digest-originals">${refs.map(m => `<div class="context-message"><small>${esc(m.sender_name || '我')} · ${formatDate(m.sent_at)}</small><p>${esc(pretty(m.text))}</p></div>`).join('')}</div>` : ''}
+    </details>`;
+  }).join('');
+  const decisions = (digest.decisions || []).length ? `<div class="digest-block"><h4>结论</h4><ul>${digest.decisions.map(d => `<li>${esc(d)}</li>`).join('')}</ul></div>` : '';
+  const hints = (digest.todo_hints || []).length ? `<div class="digest-block"><h4>可能需要行动</h4><ul>${digest.todo_hints.map(d => `<li>${esc(d)}</li>`).join('')}</ul></div>` : '';
+  const unref = messages.filter(m => !topics.some(t => (t.messages || []).includes(m.id)));
+  return `<div class="panel-head"><h3>群聊摘要</h3><span class="helper">${formatDate(digest.from)} — ${formatDate(digest.to)}</span></div>
+    <div class="detail-content">
+      <button class="link mobile-back" data-action="back-inbox">← 返回列表</button>
+      <div class="detail-meta">${sourceTag(digest.source)}<span class="helper">${esc(digest.conversation_name || '')} · ${digest.message_count || 0} 条原始消息</span></div>
+      <h2 class="detail-title">${esc(digest.headline || '群聊摘要')}</h2>
+      ${decisions}${hints}${topicHtml}
+      ${unref.length ? `<details class="context-list"><summary>其他 ${unref.length} 条原始消息</summary>${unref.map(m => `<div class="context-message"><small>${esc(m.sender_name || '我')} · ${formatDate(m.sent_at)}</small><p>${esc(pretty(m.text))}</p></div>`).join('')}</details>` : ''}
+      <div class="detail-actions"><button class="secondary" data-action="digest-regenerate">重新汇总</button><button class="plain-button" data-action="digest-delete">取消汇总，恢复原始消息</button></div>
+    </div>`;
 }
 function evidenceQuote(m) {
   const result = m.analysis; if (!result) return '';
@@ -754,9 +884,35 @@ async function runAction(action, button) {
     case 'paste': $('#paste-content').value = ''; return uiMotion.openDialog($('#paste-dialog'));
     case 'close-paste': return closableDialog($('#paste-dialog'));
     case 'close-rename': return closableDialog($('#rename-dialog'));
-    case 'back-inbox': state.selected = null; return render();
+    case 'back-inbox': state.selected = null; state.selectedDigest = null; state.digestMessages = []; return render();
+    case 'digest-all': return digestAll(button);
+    case 'digest-open': {
+      const digest = (state.snapshot.digests || []).find(d => d.id === (button?.dataset.id || state.selectedDigest));
+      if (!digest) return;
+      state.selectedDigest = digest.id; state.selected = null;
+      try { const full = await api('/api/digests/' + encodeURIComponent(digest.id)); state.digestMessages = full.messages || []; }
+      catch (error) { state.digestMessages = []; toast(error.message || '原文读取失败'); }
+      return render();
+    }
+    case 'digest-delete': {
+      // 列表中删除按钮走 data-row-action，详情页按钮没有 id，用当前选中摘要。
+      const id = button?.dataset.id || state.selectedDigest;
+      if (!id) return;
+      try { await api('/api/digests/' + encodeURIComponent(id), 'DELETE'); } catch (error) { return toast(error.message || '取消汇总失败'); }
+      state.snapshot.digests = (state.snapshot.digests || []).filter(d => d.id !== id);
+      if (state.selectedDigest === id) { state.selectedDigest = null; state.digestMessages = []; }
+      cacheSoon(); return refresh();
+    }
+    case 'digest-regenerate': {
+      const digest = (state.snapshot.digests || []).find(d => d.id === state.selectedDigest);
+      if (!digest) return;
+      return digestOne({ source: digest.source, account_id: digest.account_id, conversation_id: digest.conversation_id, force: true }, true);
+    }
     case 'back-tasks': state.taskId = null; return render();
     case 'clear-context': state.contexts.clear(); return render();
+    case 'digest-ignore': {
+      state.selectedDigest = null; state.digestMessages = []; return render();
+    }
     case 'message-task': {
       const draft = message.analysis || message.draft;
       return openTask({ ...draft, description: message.text, title: draft.title || message.draft.title }, message.id);
@@ -872,12 +1028,20 @@ document.addEventListener('click', async event => {
     const context = event.target.closest('[data-context]'); if (context) return;
     const rowAction = event.target.closest('[data-row-action]');
     if (rowAction) { runAction.sourceId = rowAction.dataset.id; return await runAction(rowAction.dataset.rowAction, rowAction); }
+    const digestRow = event.target.closest('[data-digest]');
+    if (digestRow) {
+      state.selectedDigest = digestRow.dataset.digest;
+      state.selected = null;
+      try { const full = await api('/api/digests/' + encodeURIComponent(state.selectedDigest)); state.digestMessages = full.messages || []; }
+      catch { state.digestMessages = []; }
+      return render();
+    }
     const row = event.target.closest('[data-message]');
     if (row) {
       // 就地切换选中态，不重建列表 DOM，保持滚动位置与勾选状态。
       const id = row.dataset.message;
-      if (state.selected === id) return;
-      state.selected = id;
+      if (state.selected === id && !state.selectedDigest) return;
+      state.selected = id; state.selectedDigest = null; state.digestMessages = [];
       const list = row.closest('.message-list');
       const previous = list?.querySelector('.message-row.selected');
       if (previous) previous.classList.remove('selected');
@@ -887,10 +1051,14 @@ document.addEventListener('click', async event => {
         // 移动端首次选中：需要切换双栏显示，此时才整页重绘。
         return render();
       }
+      const digestSelected = document.querySelector('.digest-row.selected');
+      if (digestSelected) return render();
       renderDetailOnly(id);
       syncLocationHash();
       return;
     }
+    const modeButton = event.target.closest('[data-inbox-mode]');
+    if (modeButton) { state.inboxMode = modeButton.dataset.inboxMode; state.selectedDigest = null; state.digestMessages = []; return render(); }
     const card = event.target.closest('[data-task]'); if (card) { state.taskId = card.dataset.task; return render(); }
     const action = event.target.closest('[data-action]'); if (action) { runAction.sourceId = null; return await runAction(action.dataset.action, action); }
     const urgencyStep = event.target.closest('[data-set-urgency]');

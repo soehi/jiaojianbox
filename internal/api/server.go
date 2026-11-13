@@ -190,6 +190,7 @@ func New(database *store.Store, assets fs.FS, version string) (*Server, error) {
 		s.reminderRoutes()
 		s.fileRoutes()
 		s.aiRoutes()
+		s.digestRoutes()
 		s.aiCreditRoutes()
 		s.accountRoutes()
 		s.transferRoutes()
