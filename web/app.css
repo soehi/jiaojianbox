@@ -112,6 +112,7 @@ nav .count{margin-left:auto;font-size:0.82rem;font-variant-numeric:tabular-nums;
 .digest-row:hover .row-actions{opacity:1;pointer-events:auto}
 .digest-row.selected{background:var(--selected);border-color:var(--selected-border)}
 .digest-badge{display:inline-block;padding:1px 6px;margin-right:6px;border-radius:4px;border:1px solid var(--border);font-size:0.72rem;color:var(--muted);vertical-align:1px}
+.triage-note{white-space:nowrap;font-variant-numeric:tabular-nums}
 .digest-topic{border-top:1px solid var(--border);padding:10px 0}
 .digest-topic summary{display:flex;gap:8px;align-items:baseline;cursor:pointer;list-style:none}
 .digest-topic summary::-webkit-details-marker{display:none}

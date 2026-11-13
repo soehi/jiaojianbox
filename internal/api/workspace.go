@@ -231,10 +231,18 @@ func (s *Server) messages(ctx context.Context, db store.SQL, rows []Object) []Ob
 	for _, m := range out {
 		delete(m, "analysis_pending")
 		delete(m, "analysis_state")
+		if str(m, "triage_state") == "pending" {
+			m["triage_pending"] = true
+		}
 		if len(object(m["analysis"])) > 0 {
 			m["analysis_state"] = "done"
 			delete(m, "analysis_error")
 			continue
+		}
+		if result := object(m["triage_result"]); len(result) > 0 {
+			// 已分诊但未升级：前端用轻量标签展示，不触发深度分析。
+			m["triage_label"] = str(result, "verdict")
+			m["triage_reason"] = str(result, "reason")
 		}
 		job := jobs[str(m, "id")]
 		if job != nil && str(m, "triage") != "ignored" {
@@ -364,13 +372,30 @@ func (s *Server) messageRoutes() {
 			m["id"] = store.ID()
 			m["created_at"] = store.Now()
 			m["draft"] = extract(str(m, "text"), sent)
-			exec(r.Context(), db, "INSERT INTO messages VALUES(?,?,?,?,?)", m["id"], r.User, dedup, store.JSON(m), m["created_at"])
 			settings := first(query(r.Context(), db, "SELECT payload FROM llm_settings WHERE user_id=?", r.User))
-			if settings != nil && eligible(store.Payload(settings), str(m, "text")) {
-				exec(r.Context(), db, "INSERT OR IGNORE INTO analysis_jobs(user_id,message_id) VALUES(?,?)", r.User, m["id"])
-				m["analysis_pending"] = true
-				m["analysis_state"] = "queued"
+			config := store.Payload(settings)
+			verdict := localVerdict{"unknown", "本地规则已关闭"}
+			if settings != nil && boolean(config, "local_triage") {
+				// 第一层：本地规则。噪声直接丢弃，强信号直接进深度分析，
+				// 其余留在待分诊队列，不占用模型额度。
+				verdict = localTriage(m)
+				m["triage_local"] = Object{"verdict": verdict.Verdict, "reason": verdict.Reason, "layer": "local", "at": store.Now()}
 			}
+			if verdict.Verdict == "noise" {
+				m["triage"] = "ignored"
+			}
+			if settings != nil && verdict.Verdict != "noise" && eligible(config, str(m, "text")) {
+				switch {
+				case verdict.Verdict == "strong", !boolean(config, "batch_triage"):
+					exec(r.Context(), db, "INSERT OR IGNORE INTO analysis_jobs(user_id,message_id) VALUES(?,?)", r.User, m["id"])
+					m["analysis_pending"] = true
+					m["analysis_state"] = "queued"
+				default:
+					// 第二层：先攒着，由分诊 worker 批量判断，只有 actionable 才升级。
+					m["triage_state"] = "pending"
+				}
+			}
+			exec(r.Context(), db, "INSERT INTO messages VALUES(?,?,?,?,?)", m["id"], r.User, dedup, store.JSON(m), m["created_at"])
 			event(r.Context(), db, r.User, "message.upsert", str(m, "id"))
 			return m
 		})

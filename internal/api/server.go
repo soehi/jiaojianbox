@@ -235,8 +235,9 @@ func New(database *store.Store, assets fs.FS, version string) (*Server, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
-	s.workers.Add(1)
+	s.workers.Add(2)
 	go func() { defer s.workers.Done(); s.analyzeWorker(ctx) }()
+	go func() { defer s.workers.Done(); s.triageWorker(ctx) }()
 	return s, nil
 }
 func (s *Server) Close() {
