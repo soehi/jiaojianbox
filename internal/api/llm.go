@@ -336,6 +336,12 @@ func (s *Server) chat(ctx context.Context, config Object, key string, messages [
 	if jsonMode {
 		body["response_format"] = Object{"type": "json_object"}
 	}
+	// thinking=false 表示这类调用只要粗判，关掉推理模式以降低延迟与 token。
+	// 各家字段名不同，同时给出常见的两种，被不认识的实现忽略即可。
+	if value, ok := option["thinking"].(bool); ok && !value {
+		body["thinking"] = Object{"type": "disabled"}
+		body["enable_thinking"] = false
+	}
 	if len(tools) > 0 {
 		body["tools"] = tools
 	}
@@ -367,6 +373,10 @@ func (s *Server) chat(ctx context.Context, config Object, key string, messages [
 				retry = true
 			} else if _, ok := body["tools"]; ok && strings.Contains(text, "tool") && (strings.Contains(text, "unsupported") || strings.Contains(text, "not support") || strings.Contains(text, "unknown")) {
 				delete(body, "tools")
+				retry = true
+			} else if _, ok := body["thinking"]; ok && strings.Contains(text, "think") && (strings.Contains(text, "unsupported") || strings.Contains(text, "not support") || strings.Contains(text, "unknown") || strings.Contains(text, "invalid")) {
+				delete(body, "thinking")
+				delete(body, "enable_thinking")
 				retry = true
 			}
 			if retry {

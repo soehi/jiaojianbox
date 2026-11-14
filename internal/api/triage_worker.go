@@ -97,6 +97,15 @@ func (s *Server) applyTriage(ctx context.Context, group triageGroup, verdicts ma
 			current["triage_state"] = "done"
 			current["triage_batch"] = verdict
 			label := str(verdict, "verdict")
+			// worth_showing=false 表示纯应付消息（「也行」「收到」），
+			// 不进通知列表，但仍参与群聊摘要。
+			worth := true
+			if value, ok := verdict["worth_showing"].(bool); ok {
+				worth = value
+			}
+			if !worth {
+				label = "chatting"
+			}
 			if label == "actionable" && num(verdict, "confidence") >= 0.5 {
 				// 第三层：只把批判断为 actionable 的消息送进深度分析。
 				exec(ctx, db, "INSERT OR IGNORE INTO analysis_jobs(user_id,message_id) VALUES(?,?)", group.User, id)

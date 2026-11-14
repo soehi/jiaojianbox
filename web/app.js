@@ -383,6 +383,7 @@ function digestableMessages() {
   const seen = new Map();
   for (const message of state.snapshot.messages) {
     if (message.triage === 'ignored' || message.digest_id) continue;
+    if (message.triage_state === 'pending') continue;
     if (isActionable(message)) continue;
     const key = message.source + '|' + message.account_id + '|' + message.conversation_id;
     if (!seen.has(key)) seen.set(key, { source: message.source, account_id: message.account_id, conversation_id: message.conversation_id, newest: 0 });
@@ -391,6 +392,10 @@ function digestableMessages() {
   }
   return [...seen.values()].sort((a, b) => b.newest - a.newest);
 }
+function worthwhile(message) {
+  // 模型判定为纯应付（「也行」「收到」）时不单独展示，只留在摘要里。
+  return message.triage_worth_showing !== false;
+}
 function filteredMessages() {
   const mode = inboxMode();
   return state.snapshot.messages.filter(m => {
@@ -398,6 +403,8 @@ function filteredMessages() {
     if (state.source !== 'all' && m.source !== state.source) return false;
     if (state.category === 'ignored') return m.triage === 'ignored';
     if (m.triage === 'ignored') return false;
+    // 已通过分诊判定为无价值的消息只在摘要中出现。
+    if (!worthwhile(m)) return false;
     // 摘要视图只保留需要行动或尚未分析的消息，其余交给群聊摘要。
     if (mode === 'digest' && state.category === 'all' && !isActionable(m) && !needsAttention(m)) return false;
     if (state.category !== 'all' && classification !== state.category) return false;

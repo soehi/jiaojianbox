@@ -247,6 +247,9 @@ func (s *Server) messages(ctx context.Context, db store.SQL, rows []Object) []Ob
 			// 已分诊但未升级：前端用轻量标签展示，不触发深度分析。
 			m["triage_label"] = str(result, "verdict")
 			m["triage_reason"] = str(result, "reason")
+			if worth, ok := result["worth_showing"].(bool); ok {
+				m["triage_worth_showing"] = worth
+			}
 		}
 		if len(object(m["analysis"])) > 0 {
 			m["analysis_state"] = "done"

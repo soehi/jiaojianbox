@@ -260,6 +260,8 @@ func New(database *store.Store, assets fs.FS, version string) (*Server, error) {
 	s.workers.Add(1)
 	go func() { defer s.workers.Done(); s.triageWorker(ctx) }()
 	s.workers.Add(1)
+	go func() { defer s.workers.Done(); s.digestWorker(ctx) }()
+	s.workers.Add(1)
 	go s.recycleWorker(ctx)
 	return s, nil
 }

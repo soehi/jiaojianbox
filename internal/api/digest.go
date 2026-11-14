@@ -5,7 +5,6 @@ package api
 
 import (
 	"context"
-	"strings"
 	"time"
 
 	"github.com/NekoYume517/jiaojianbox/internal/store"
@@ -160,52 +159,7 @@ func (s *Server) digestOne(ctx context.Context, user string, body Object, p prog
 	raw := robustJSON(call.Text)
 	success = true
 
-	idSet := map[string]bool{}
-	for _, item := range items {
-		idSet[item.ID] = true
-	}
-	topics := []Object{}
-	seen := map[string]bool{}
-	for _, value := range asList(raw["topics"], 3) {
-		topic := object(value)
-		title := strings.TrimSpace(clip(fmtValue(topic["title"]), 40))
-		if title == "" || seen[title] {
-			continue
-		}
-		seen[title] = true
-		ids := []any{}
-		for _, v := range asList(topic["messages"], 40) {
-			identity := fmtValue(v)
-			if idSet[identity] {
-				ids = append(ids, identity)
-				delete(idSet, identity)
-			}
-		}
-		topics = append(topics, Object{
-			"title":    title,
-			"summary":  clip(fmtValue(topic["summary"]), 200),
-			"messages": ids,
-		})
-	}
-	if len(topics) == 0 {
-		topics = append(topics, Object{
-			"title":    "闲聊概览",
-			"summary":  clip(fmtValue(raw["headline"]), 200),
-			"messages": []any{},
-		})
-	}
-	// 模型漏掉的原始消息归到最后一个话题，保证每条消息都能回到原文。
-	orphan := []any{}
-	for _, item := range items {
-		if idSet[item.ID] {
-			orphan = append(orphan, item.ID)
-			delete(idSet, item.ID)
-		}
-	}
-	if len(orphan) > 0 {
-		last := topics[len(topics)-1]
-		last["messages"] = append(list(last, "messages"), orphan...)
-	}
+	topics, _ := buildDigestTopics(raw, items)
 
 	result := Object{
 		"id":               store.ID(),
